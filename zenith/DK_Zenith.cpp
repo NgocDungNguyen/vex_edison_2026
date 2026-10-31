@@ -123,9 +123,22 @@ bool RemoteControlCodeEnabled = true;
      Brain screen shows: line1 "L4 deg/needed OK|LOW", line2 "Dist mm OK|FAR", line3 "SHOOT READY|BLOCKED"
      (or "MAINT: FDown=revalidate").
   3) SHOOT / RELOAD (main loop whenStarted1, non-blocking so driving never freezes):
-       FUp : L3 spins forward for L3_SHOT_MS = fires; after that, while the sensor reads FAR for
-             3 loops in a row, L3 keeps spinning forward = reload; when <= 35 mm it stop(hold) ONCE (a latch,
-             L3_holding, because re-sending hold every loop makes it creep).
+       FUp : L3 spins forward at once. It is NOT time based: when the sensor reads FAR for 3 loops in a row
+             (after L3_FIRE_MIN_MS) the shot has FIRED, and L3 simply keeps spinning forward = reload with no stop
+             in between; when <= 35 mm it stop(hold) ONCE (a latch, L3_holding, because re-sending hold every
+             loop makes it creep). L3_FIRE_TIMEOUT_MS = safety if nothing ever fires.
+             PRE-LOAD: on that sensor catch it keeps pulling L3_preloadDeg more, then holds, so the next FUp only
+             has to release (no ~1 s extra pull-down). FUp during the pre-load fires at once.
+             AUTO (L3_PRELOAD_AUTO 1): learns SLOWLY. After every FUp it measures "trv" = degrees still left from
+             the HELD position to the release, and changes pre-load by (trv - L3_PRELOAD_MARGIN), but it may GROW
+             by at most L3_PRELOAD_STEP (40) per shot (so the first ~4-6 shots get faster and faster; it never
+             jumps past the release). If trv is below the margin it shrinks at once. If L3 ever releases by
+             itself during/after the pre-load, pre-load backs off 2 steps and may only shrink until restart.
+             Brain line 4: "trv" (aim ~ the margin) and "pre" = current pre-load. When "pre" stops changing you
+             can copy it into L3_PRELOAD_DEG and set L3_PRELOAD_AUTO 0 (fixed, no learning, every shot fast).
+   BUG FIXED (twice): pre-load was learned from the sensor-catch position / in one big jump, ignoring how far
+             the motor coasts when it stops -> it stopped past the release, L3 fired by itself and re-shot 1-4
+             times after a single FUp. Do not go back to a one-jump pre-load.
        FDown: same forced spin for L3_MAINT_SHOT_MS, then stop(coast) and NO reload (maintenance mode).
   4) INTAKE: decided in ONE place in the loop: LDown reverse > Intake_F==1 forward > stop.
        FUp/FDown press -> STOP 1: Intake_F = 0 and `shootCycle = true` (LUp locked).
@@ -156,7 +169,9 @@ bool RemoteControlCodeEnabled = true;
    L4_UP_POS                        real up position (watch the L4 line on the Brain screen)
    L4_INIT_MS 1000                  start-up arm homing time
    L4_STALL_DEG 3 / L4_STALL_GRACE_MS 300   stall detection in L4_moveTo (raise DEG if RDown ends too early)
-   L3_SHOT_MS / L3_MAINT_SHOT_MS    how long the forced shooter spin lasts
+   L3_PRELOAD_AUTO 1 / L3_PRELOAD_MARGIN 50   auto-learned extra pull after the sensor catch (kills the pull-down delay on FUp). See FUp notes.
+   L3_FIRE_MIN_MS / L3_FIRE_TIMEOUT_MS   FUp "fired" detection filter / safety timeout
+   L3_MAINT_SHOT_MS                 how long the FDown (maintenance) forced spin lasts
    L3_STOP_MM 35                    "loaded" distance threshold
    L3_PULL_SPEED 100                lower it (e.g. 60) if L3 overshoots the sensor and fires at start-up
    L4_SHOOT_MIN_POS / L4_SHOOT_FRACTION   how high the arm must be before shooting is allowed
@@ -220,7 +235,19 @@ const double L4_STALL_DEG      = 3.0;   // less than this many degrees per check
 const int    L4_INIT_MS = 1000;     // start-up: L4 reverses by TIME to its start position
 
 // --- L3 (shoot) ---
-const int    L3_SHOT_MS = 800;    // forced spin when FUp is pressed
+// FUp: L3 spins until the distance sensor says it FIRED (reads FAR), then simply KEEPS spinning = reload (no stop in between).
+const int    L3_FIRE_MIN_MS = 200;      // ignore "fired" for this long after the press (sensor noise)
+const int    L3_FIRE_TIMEOUT_MS = 2000; // safety: if nothing fired after this long, stop and hold
+// PRE-LOAD: after the reload catches the sensor, pull MORE degrees and hold there, so FUp only has to release (no pull-down delay).
+// AUTO (1): the robot LEARNS the distance by itself. The FIRST shot after start-up is still slow (it measures the
+// travel from the sensor catch to the release); from the 2nd shot on, the pre-load = measured travel - L3_PRELOAD_MARGIN.
+// AUTO (0): uses L3_PRELOAD_DEG as a fixed number (0 = no pre-load).
+#define L3_PRELOAD_AUTO 1
+const double L3_PRELOAD_DEG = 0.0;      // start value (AUTO 1) or fixed value (AUTO 0)
+const double L3_PRELOAD_MARGIN = 50.0;  // degrees still left between the held position and the release. Raise it if a shot ever fires by itself after reload; lower it (e.g. 30) to cut the remaining delay
+const double L3_PRELOAD_MAX = 500.0;    // safety cap for the learned value
+const double L3_PRELOAD_STEP = 40.0;    // the pre-load grows by at most this many degrees per shot (learns SLOWLY from below, never jumps past the release)
+const int    L3_PRELOAD_TIMEOUT_MS = 1500; // safety for the extra pull
 const int    L3_MAINT_SHOT_MS = 800; // forced spin when FDown is pressed (shoot WITHOUT reload) - tune so it ends released, not re-pulled
 const double L3_STOP_MM = 35.0;    // L3 spins until the sensor reads this or less
 const int    L3_PULL_TIMEOUT_MS = 5000; // start-up pull-back: give up after this long (per try) if the sensor never triggers
@@ -425,6 +452,19 @@ int whenStarted1() {
   int  screenTick = 0;
   bool L4_driftFix = false;    // latch: keeper already sent the arm back to 0
   int  farTicks = 0;           // how many loops in a row the sensor read FAR (debounce, avoids a flicker triggering a reload spin)
+  double farPos = 0.0;         // L3 position at the first FAR reading (= where it released)
+  bool   L3_firing = false;    // FUp shot in progress (spins until the sensor says it fired)
+  int    L3_fireTicks = 0;     // loops since the FUp press
+  double L3_fireStartPos = 0.0;// L3 position at the FUp press
+  double L3_travel = 0.0;      // measured travel from hold to release (shown on the Brain; use it to set L3_PRELOAD_DEG)
+  bool   L3_preloading = false;// extra pull after the sensor caught it
+  bool   L3_preHeld = false;   // holding at the pre-loaded position (a FAR reading now = it released by itself)
+  bool   L3_skipLearn = false; // this shot must not change the learned pre-load
+  bool   L3_preloadLocked = false; // L3 once released by itself during the pre-load: the pre-load may only get SMALLER from now on
+  double L3_preloadDeg = L3_PRELOAD_DEG; // current pre-load (learned when AUTO)
+  double L3_catchPos = 0.0;    // L3 position where the sensor caught it (0 right after calibration)
+  double L3_preloadTarget = 0.0;
+  int    L3_preloadTicks = 0;
 
   while (true) {
     // ---- Drive ----
@@ -460,7 +500,7 @@ int whenStarted1() {
       }
     }
 
-    // ---- L3 (shoot): FUp = forced spin for L3_SHOT_MS (one shot per press), else distance sensor ----
+    // ---- L3 (shoot): FUp = spin until the sensor says it fired, then reload (one shot per press) ----
     bool fUp = Controller.ButtonFUp.pressing();
     // Shoot gate = ARM + DISTANCE
     //  arm:  not moving, above the floor, and above a fraction of the height it really reached
@@ -472,7 +512,12 @@ int whenStarted1() {
     bool needReload = false;      // sensor says L3 is not pulled back yet
 #if USE_DISTANCE_SENSOR
     distMm = Distance7.objectDistance(mm);
-    if (distMm > L3_STOP_MM) { farTicks++; } else { farTicks = 0; }
+    if (distMm > L3_STOP_MM) {
+      farTicks++;
+      if (farTicks == 1) { farPos = L3MotorA.position(degrees); }   // first FAR reading = where it released
+    } else {
+      farTicks = 0;
+    }
     needReload = (farTicks >= 3);   // FAR for 3 loops (60 ms) in a row
 #endif
     bool armOk = (!L4_busy) && (armDeg >= shootMinPos);
@@ -481,21 +526,54 @@ int whenStarted1() {
     distOk = (distMm <= L3_STOP_MM);
 #endif
     bool shootReady = armOk && distOk;
-    if (fUp && !fUpWasPressed && L3_shotTicks == 0 && shootReady && !maintenance) {
-      L3_shotTicks = L3_SHOT_MS / 20;
+    if (fUp && !fUpWasPressed && L3_shotTicks == 0 && !L3_firing && shootReady && !maintenance) {
+      L3_firing = true;           // L3 spins at once (also cancels a running pre-load)
+      L3_skipLearn = L3_preloading;   // FUp pressed before the pre-load finished: this shot says nothing about the pre-load
+      L3_preloading = false;
+      L3_preHeld = false;
+      L3_fireTicks = 0;
+      L3_fireStartPos = L3MotorA.position(degrees);
       shootCycle = true;          // STOP 1: FUp clicked -> intake off, LUp locked
       Intake_F = 0.0;
     }
     fUpWasPressed = fUp;
 
+    // FUp shot ends when the sensor says it FIRED (FAR for 3 loops, after the minimum time). L3 is NOT stopped:
+    // it keeps spinning forward and the reload branch below takes over = reload starts with no gap.
+    if (L3_firing) {
+      L3_fireTicks++;
+      if (needReload && L3_fireTicks * 20 >= L3_FIRE_MIN_MS) {
+        L3_firing = false;
+        L3_travel = farPos - L3_fireStartPos;       // degrees from the hold position to the release
+#if L3_PRELOAD_AUTO
+        if (!L3_skipLearn) {                        // learn by feedback: the travel still left after the hold should be ~ the margin
+          double delta = L3_travel - L3_PRELOAD_MARGIN;          // + = can pull more, - = pulled too far
+          if (delta > L3_PRELOAD_STEP) { delta = L3_PRELOAD_STEP; }   // grow slowly (a few shots), shrink at once
+          if (delta > 0.0 && L3_preloadLocked) { delta = 0.0; }       // after a self-release it may only shrink
+          double learned = L3_preloadDeg + delta;
+          if (learned < 0.0) { learned = 0.0; }
+          if (learned > L3_PRELOAD_MAX) { learned = L3_PRELOAD_MAX; }
+          L3_preloadDeg = learned;
+        }
+#endif
+      } else if (L3_fireTicks * 20 >= L3_FIRE_TIMEOUT_MS) {
+        L3_firing = false;                          // never fired: falls through to hold below
+      }
+    }
+
     // FDown: shoot WITHOUT reload (same gate: arm OK + distance OK; the arm is never touched).
     //   FDown again while in maintenance = re-validate like first start (shooter first, then arm).
     bool fDown = Controller.ButtonFDown.pressing();
-    if (fDown && !fDownWasPressed && L3_shotTicks == 0) {
+    if (fDown && !fDownWasPressed && L3_shotTicks == 0 && !L3_firing) {
       if (maintenance) {
         calibrateAll();           // blocks: distance -> pull shooter back -> then arm -> flags reset (maintenance = false)
         L3_holding = true;
+        L3_preloading = false;
+        L3_preHeld = false;
+        L3_catchPos = 0.0;        // calibrateAll() zeroed the encoders at the sensor catch
       } else if (shootReady) {
+        L3_preloading = false;
+        L3_preHeld = false;
         L3_shotTicks = L3_MAINT_SHOT_MS / 20;
         maintenance = true;       // no reload from now until re-validated
         shootCycle = true;
@@ -504,8 +582,11 @@ int whenStarted1() {
     }
     fDownWasPressed = fDown;
 
-    if (L3_shotTicks > 0) {
-      L3.spin(forward);
+    if (L3_firing) {
+      L3.spin(forward);           // FUp shot: spin until the sensor says it fired (handled above)
+      L3_holding = false;
+    } else if (L3_shotTicks > 0) {
+      L3.spin(forward);           // FDown maintenance shot (fixed time)
       L3_holding = false;
       L3_shotTicks--;
       if (L3_shotTicks == 0) {
@@ -515,10 +596,35 @@ int whenStarted1() {
     } else if (maintenance) {
       if (shootCycle) { shootCycle = false; }   // shot done, NO reload, intake stays off
     } else if (needReload) {
+      if (L3_preloading || L3_preHeld) {          // it released BY ITSELF during/after the pre-load: pre-load was too big
+        L3_preloadDeg -= 2.0 * L3_PRELOAD_STEP;   // back off two steps (the last shot was still fine one step ago)
+        if (L3_preloadDeg < 0.0) { L3_preloadDeg = 0.0; }
+        L3_preloadLocked = true;                  // and never grow again until restart
+      }
+      L3_preloading = false;      // released (shot) or lost the sensor -> normal reload
+      L3_preHeld = false;
       L3.spin(forward);
       L3_holding = false;
+    } else if (L3_preloading) {
+      L3.spin(forward);           // extra pull after the sensor caught it, then HOLD
+      L3_preloadTicks--;
+      if (L3MotorA.position(degrees) >= L3_preloadTarget || L3_preloadTicks <= 0) {
+        L3_preloading = false;
+        L3_preHeld = true;
+        L3.stop(hold);
+      }
     } else {
-      if (!L3_holding) { L3.stop(hold); L3_holding = true; }   // pulled back: HOLD it (once)
+      if (!L3_holding) {          // the sensor JUST caught it
+        L3_catchPos = L3MotorA.position(degrees);
+        if (L3_preloadDeg > 0.0) {
+          L3_preloading = true;   // keep spinning (no stop) for L3_preloadDeg more, then hold
+          L3_preloadTarget = L3_catchPos + L3_preloadDeg;
+          L3_preloadTicks = L3_PRELOAD_TIMEOUT_MS / 20;
+        } else {
+          L3.stop(hold);          // pulled back: HOLD it (once)
+        }
+        L3_holding = true;
+      }
       if (shootCycle) {           // STOP 2 ends: shot done, L3 pulled back and holding -> intake starts again, LUp unlocked
         shootCycle = false;
         Intake_F = 1.0;
@@ -540,6 +646,8 @@ int whenStarted1() {
       Brain.Screen.setCursor(3, 1);
       if (maintenance) { Brain.Screen.print("MAINT: FDown=revalidate  "); }
       else             { Brain.Screen.print("SHOOT %s   ", shootReady ? "READY" : "BLOCKED"); }
+      Brain.Screen.setCursor(4, 1);
+      Brain.Screen.print("L3 trv %3.0f pre %3.0f  ", L3_travel, L3_preloadDeg);   // last FUp: degrees from hold to release / current pre-load
     }
 
     wait(20, msec);
